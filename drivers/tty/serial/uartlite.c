@@ -14,7 +14,9 @@
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/delay.h>
-#include <linux/interrupt.h>
+#include <linux/irq.h>  // 需要包含头文件以使用中断相关函数
+#include <linux/interrupt.h>  // 需要包含头文件以使用中断相关函数
+#include <linux/cpumask.h>  // 需要包含头文件以使用CPU亲和性
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -63,9 +65,18 @@
 static struct uart_port *console_port;
 #endif
 
+/**
+ * struct uartlite_data: Driver private data
+ * reg_ops: Functions to read/write registers
+ * clk: Our parent clock, if present
+ * baud: The baud rate configured when this device was synthesized
+ * cflags: The cflags for parity and data bits
+ */
 struct uartlite_data {
 	const struct uartlite_reg_ops *reg_ops;
 	struct clk *clk;
+	unsigned int baud;
+	tcflag_t cflags;
 };
 
 struct uartlite_reg_ops {
@@ -297,6 +308,7 @@ static void ulite_shutdown(struct uart_port *port)
 	struct uartlite_data *pdata = port->private_data;
 
 	uart_out32(0, ULITE_CONTROL, port);
+	uart_in32(ULITE_CONTROL, port); /* dummy */
 	free_irq(port->irq, port);
 	clk_disable(pdata->clk);
 }
@@ -305,7 +317,13 @@ static void ulite_set_termios(struct uart_port *port, struct ktermios *termios,
 			      struct ktermios *old)
 {
 	unsigned long flags;
-	unsigned int baud;
+	struct uartlite_data *pdata = port->private_data;
+
+	/* Set termios to what the hardware supports */
+	termios->c_iflag &= ~BRKINT;
+	termios->c_cflag &= ~(CSTOPB | PARENB | PARODD | CSIZE);
+	termios->c_cflag |= pdata->cflags & (PARENB | PARODD | CSIZE);
+	tty_termios_encode_baud_rate(termios, pdata->baud, pdata->baud);
 
 	spin_lock_irqsave(&port->lock, flags);
 
@@ -328,8 +346,7 @@ static void ulite_set_termios(struct uart_port *port, struct ktermios *termios,
 			| ULITE_STATUS_FRAME | ULITE_STATUS_OVERRUN;
 
 	/* update timeout */
-	baud = uart_get_baud_rate(port, termios, old, 0, 460800);
-	uart_update_timeout(port, termios->c_cflag, baud);
+	uart_update_timeout(port, termios->c_cflag, pdata->baud);
 
 	spin_unlock_irqrestore(&port->lock, flags);
 }
@@ -367,6 +384,7 @@ static int ulite_request_port(struct uart_port *port)
 	}
 
 	pdata->reg_ops = &uartlite_be;
+	uart_in32(ULITE_CONTROL, port);
 	uart_out32(ULITE_CONTROL_RST_TX, ULITE_CONTROL, port);
 	ret = uart_in32(ULITE_STATUS, port);
 	/* Endianess detection */
@@ -763,17 +781,72 @@ static int ulite_probe(struct platform_device *pdev)
 	struct uartlite_data *pdata;
 	int irq, ret;
 	int id = pdev->id;
-#ifdef CONFIG_OF
-	const __be32 *prop;
 
-	prop = of_get_property(pdev->dev.of_node, "port-number", NULL);
-	if (prop)
-		id = be32_to_cpup(prop);
-#endif
 	pdata = devm_kzalloc(&pdev->dev, sizeof(struct uartlite_data),
 			     GFP_KERNEL);
 	if (!pdata)
 		return -ENOMEM;
+
+	if (IS_ENABLED(CONFIG_OF)) {
+		const char *prop;
+		struct device_node *np = pdev->dev.of_node;
+		u32 val = 0;
+
+		prop = "port-number";
+		ret = of_property_read_u32(np, prop, &id);
+		if (ret && ret != -EINVAL)
+of_err:
+			return dev_err_probe(&pdev->dev, ret,
+					     "could not read %s\n", prop);
+
+		prop = "current-speed";
+		ret = of_property_read_u32(np, prop, &pdata->baud);
+		if (ret)
+			goto of_err;
+
+		prop = "xlnx,use-parity";
+		ret = of_property_read_u32(np, prop, &val);
+		if (ret && ret != -EINVAL)
+			goto of_err;
+
+		if (val) {
+			prop = "xlnx,odd-parity";
+			ret = of_property_read_u32(np, prop, &val);
+			if (ret)
+				goto of_err;
+
+			if (val)
+				pdata->cflags |= PARODD;
+			pdata->cflags |= PARENB;
+		}
+
+		val = 8;
+		prop = "xlnx,data-bits";
+		ret = of_property_read_u32(np, prop, &val);
+		if (ret && ret != -EINVAL)
+			goto of_err;
+
+		switch (val) {
+		case 5:
+			pdata->cflags |= CS5;
+			break;
+		case 6:
+			pdata->cflags |= CS6;
+			break;
+		case 7:
+			pdata->cflags |= CS7;
+			break;
+		case 8:
+			pdata->cflags |= CS8;
+			break;
+		default:
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "bad data bits %d\n", val);
+		}
+	} else {
+		pdata->baud = 9600;
+		pdata->cflags = CS8;
+	}
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
