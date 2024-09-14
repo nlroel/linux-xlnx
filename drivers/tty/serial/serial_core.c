@@ -349,7 +349,7 @@ uart_update_timeout(struct uart_port *port, unsigned int cflag,
 	 * Figure the timeout to send the above number of bits.
 	 * Add .02 seconds of slop
 	 */
-	pr_info("!!!!!!!!!!!! HZ (%d) !!!!!!!!!!!!! \n", HZ);
+	// pr_info("!!!!!!!!!!!! HZ (%d) !!!!!!!!!!!!! \n", HZ);
 	port->timeout = (HZ * size) / baud + HZ/50;
 }
 
